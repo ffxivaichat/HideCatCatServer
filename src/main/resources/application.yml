@@ -1,0 +1,21 @@
+server:
+  port: ${APP_PORT:8091}
+
+spring:
+  application:
+    name: hidecatcat-server
+
+  datasource:
+    url: ${SPRING_DATASOURCE_URL:jdbc:mariadb://localhost:3306/hidecatcat?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Shanghai}
+    driver-class-name: org.mariadb.jdbc.Driver
+    username: ${SPRING_DATASOURCE_USERNAME:changeme}
+    password: ${SPRING_DATASOURCE_PASSWORD:changeme}
+
+  jpa:
+    database-platform: org.hibernate.dialect.MariaDBDialect
+    hibernate:
+      ddl-auto: update
+    show-sql: false
+    properties:
+      hibernate:
+        format_sql: true

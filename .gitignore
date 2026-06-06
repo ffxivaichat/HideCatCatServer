@@ -1,0 +1,7 @@
+target/
+*.class
+*.jar
+*.log
+.idea/
+app.pid
+app.log
