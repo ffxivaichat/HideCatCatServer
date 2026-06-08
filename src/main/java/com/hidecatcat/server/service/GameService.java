@@ -151,8 +151,30 @@ public class GameService {
             return;
         }
 
+        var playerServer = safeStr(json, "playerServer", "");
+        var playerTerritory = safeInt(json, "territoryId", 0);
+
+        // 第一个加入者设定房间基准服务器/地图
+        if (room.playerCount() == 0) {
+            room.setRoomServer(playerServer);
+            room.setTerritoryId(playerTerritory);
+            log.info("[房间] password={} 基准服务器={} 地图={}", room.getPassword(), playerServer, playerTerritory);
+        }
+
+        // 校验同服同图
+        if (!playerServer.equals(room.getRoomServer())) {
+            broadcaster.send(sessionId, Map.of("type", "ERROR",
+                    "message", "无法加入：你所在的服务器(" + playerServer + ")与房间(" + room.getRoomServer() + ")不一致"));
+            return;
+        }
+        if (playerTerritory != room.getTerritoryId()) {
+            broadcaster.send(sessionId, Map.of("type", "ERROR",
+                    "message", "无法加入：你所在的地图(" + playerTerritory + ")与房间(" + room.getTerritoryId() + ")不一致"));
+            return;
+        }
+
         var player = room.addPlayer(sessionId, name, team);
-        player.server = safeStr(json, "playerServer", "");
+        player.server = playerServer;
         log.info("[加入] {}@{} 选择 {} 队 房间 password={}", name, player.server, team, room.getPassword());
 
         // 新玩家自己收到完整列表

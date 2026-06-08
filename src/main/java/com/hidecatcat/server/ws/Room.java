@@ -17,6 +17,10 @@ public class Room {
     private String hostName;
     private GameState state = GameState.WAITING;
 
+    // 房间基准：第一个加入玩家的服务器和地图
+    private String roomServer;
+    private long territoryId;
+
     /** sessionId → Player */
     private final Map<String, Player> players = new ConcurrentHashMap<>();
 
@@ -35,6 +39,10 @@ public class Room {
     public String getHostSessionId() { return hostSessionId; }
     public String getHostName() { return hostName; }
     public GameState getState() { return state; }
+    public String getRoomServer() { return roomServer; }
+    public void setRoomServer(String s) { this.roomServer = s; }
+    public long getTerritoryId() { return territoryId; }
+    public void setTerritoryId(long id) { this.territoryId = id; }
     public void setState(GameState state) { this.state = state; }
     public Settings getSettings() { return settings; }
     public boolean isSettingsLocked() { return settingsLocked; }
@@ -119,6 +127,8 @@ public class Room {
                 "type", "player_list",
                 "hostName", hostName,
                 "gameState", state.name(),
+                "roomServer", roomServer != null ? roomServer : "",
+                "roomTerritoryId", territoryId,
                 "catCount", catCount(),
                 "mouseCount", mouseCount(),
                 "settingsLocked", settingsLocked,
