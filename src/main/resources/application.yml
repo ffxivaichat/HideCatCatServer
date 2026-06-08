@@ -1,15 +1,18 @@
 server:
   port: ${APP_PORT:8091}
 
+game:
+  max-rooms: 100
+
 spring:
   application:
     name: hidecatcat-server
 
   datasource:
-    url: ${SPRING_DATASOURCE_URL:jdbc:mariadb://localhost:3306/hidecatcat?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Shanghai}
+    url: ${SPRING_DATASOURCE_URL:jdbc:mariadb://localhost:3306/hidecatcat?useSSL=true&serverTimezone=Asia/Shanghai}
     driver-class-name: org.mariadb.jdbc.Driver
-    username: ${SPRING_DATASOURCE_USERNAME:changeme}
-    password: ${SPRING_DATASOURCE_PASSWORD:changeme}
+    username: ${SPRING_DATASOURCE_USERNAME:your-db-user}
+    password: ${SPRING_DATASOURCE_PASSWORD:your-db-password}
 
   jpa:
     database-platform: org.hibernate.dialect.MariaDBDialect

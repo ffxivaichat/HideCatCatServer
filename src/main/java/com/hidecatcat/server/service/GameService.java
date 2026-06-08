@@ -11,6 +11,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.context.annotation.Lazy;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
 import java.util.Map;
@@ -36,6 +37,9 @@ public class GameService {
     /** sessionId → password */
     private final Map<String, String> sessionRooms = new ConcurrentHashMap<>();
 
+    @Value("${game.max-rooms:100}")
+    private int maxRooms;
+
     public GameService(MatchHistoryRepository matchRepo,
                        MatchPlayerDetailRepository detailRepo,
                        PlayerStatsRepository statsRepo) {
@@ -53,13 +57,24 @@ public class GameService {
     // 房间管理
     // ================================================================
 
-    /** 玩家加入房间 */
-    public void onPlayerJoin(String password, String sessionId) {
+    /**
+     * 玩家加入房间。
+     * @return true 加入成功，false 被拒绝（房间数已达上限）
+     */
+    public boolean onPlayerJoin(String password, String sessionId) {
+        // 新房间 & 已达上限 → 拒绝
+        if (!rooms.containsKey(password) && rooms.size() >= maxRooms) {
+            log.warn("[房间] 已达上限 {} 拒绝新房间 password={}", maxRooms, password);
+            broadcaster.send(sessionId, Map.of("type", "ERROR", "message", "服务器房间已满，请稍后再试"));
+            return false;
+        }
+
         var room = rooms.computeIfAbsent(password, Room::new);
         sessionRooms.put(sessionId, password);
 
-        log.info("[房间] {} 加入房间 password={} 当前人数={}", sessionId, password, room.playerCount());
-        // 此时还未收到 JOIN_ROOM 消息，不知道玩家名和阵营，先暂存连接
+        log.info("[房间] {} 加入房间 password={} 当前人数={} 总房间数={}",
+                sessionId, password, room.playerCount(), rooms.size());
+        return true;
     }
 
     /** 玩家断开 */
@@ -83,9 +98,28 @@ public class GameService {
         }
     }
 
+    // ── 安全 JSON 访问工具 ──
+    private static String safeStr(JsonObject json, String key, String def) {
+        var el = json.get(key);
+        return el != null && el.isJsonPrimitive() ? el.getAsString() : def;
+    }
+    private static int safeInt(JsonObject json, String key, int def) {
+        var el = json.get(key);
+        try { return el != null ? el.getAsInt() : def; } catch (Exception e) { return def; }
+    }
+    private static double safeDouble(JsonObject json, String key, double def) {
+        var el = json.get(key);
+        try { return el != null ? el.getAsDouble() : def; } catch (Exception e) { return def; }
+    }
+    private static float safeFloat(JsonObject json, String key, float def) {
+        var el = json.get(key);
+        try { return el != null ? el.getAsFloat() : def; } catch (Exception e) { return def; }
+    }
+
     /** 处理消息分发 */
     public void handleMessage(String password, String sessionId, JsonObject json) {
-        var type = json.get("type").getAsString();
+        var type = safeStr(json, "type", "");
+        if (type.isEmpty()) return;
         var room = rooms.get(password);
         if (room == null) return;
 
@@ -102,13 +136,23 @@ public class GameService {
     }
 
     private void handleJoinRoom(Room room, String sessionId, JsonObject json) {
-        var name = json.get("playerName").getAsString();
-        var team = Room.Team.valueOf(json.get("team").getAsString());
+        // 游戏已开始或已结束 → 拒绝加入
+        if (room.getState() == Room.GameState.PLAYING || room.getState() == Room.GameState.FINISHED) {
+            broadcaster.send(sessionId, Map.of("type", "ERROR", "message", "游戏已开始，无法加入"));
+            log.warn("[加入] 拒绝 session={} 房间已在进行中 password={}", sessionId, room.getPassword());
+            return;
+        }
+
+        var name = safeStr(json, "playerName", "");
+        var teamStr = safeStr(json, "team", "");
+        Room.Team team;
+        try { team = Room.Team.valueOf(teamStr); } catch (IllegalArgumentException e) {
+            broadcaster.send(sessionId, Map.of("type", "ERROR", "message", "无效的阵营: " + teamStr));
+            return;
+        }
 
         var player = room.addPlayer(sessionId, name, team);
-        if (json.has("playerServer")) {
-            player.server = json.get("playerServer").getAsString();
-        }
+        player.server = safeStr(json, "playerServer", "");
         log.info("[加入] {}@{} 选择 {} 队 房间 password={}", name, player.server, team, room.getPassword());
 
         // 新玩家自己收到完整列表
@@ -146,14 +190,16 @@ public class GameService {
 
         var settings = room.getSettings();
         var pos = json.getAsJsonObject("startPos");
-        settings.startX = pos.get("x").getAsDouble();
-        settings.startY = pos.get("y").getAsDouble();
-        settings.startZ = pos.get("z").getAsDouble();
-        settings.radius = json.get("radius").getAsFloat();
-
-        if (json.has("winCondition")) settings.winCondition = json.get("winCondition").getAsString();
-        if (json.has("winCount")) settings.winCount = json.get("winCount").getAsInt();
-        if (json.has("timeLimitSec")) settings.timeLimitSec = json.get("timeLimitSec").getAsInt();
+        if (pos != null) {
+            settings.startX = safeDouble(pos, "x", settings.startX);
+            settings.startY = safeDouble(pos, "y", settings.startY);
+            settings.startZ = safeDouble(pos, "z", settings.startZ);
+        }
+        settings.radius = safeFloat(json, "radius", settings.radius);
+        var wc = safeStr(json, "winCondition", "");
+        if (!wc.isEmpty()) settings.winCondition = wc;
+        settings.winCount = safeInt(json, "winCount", settings.winCount);
+        settings.timeLimitSec = safeInt(json, "timeLimitSec", settings.timeLimitSec);
 
         log.info("[设置] password={} 起点=({},{},{}) 半径={} 胜利={}:{} 时间={}s",
                 room.getPassword(), settings.startX, settings.startY, settings.startZ,
@@ -250,16 +296,18 @@ public class GameService {
 
         // 更新坐标
         var pos = json.getAsJsonObject("position");
-        player.x = pos.get("x").getAsDouble();
-        player.y = pos.get("y").getAsDouble();
-        player.z = pos.get("z").getAsDouble();
+        if (pos != null) {
+            player.x = safeDouble(pos, "x", player.x);
+            player.y = safeDouble(pos, "y", player.y);
+            player.z = safeDouble(pos, "z", player.z);
+        }
 
         // 广播更新后的位置
         broadcaster.broadcast(room.getPassword(), room.buildPlayerListMessage());
 
         // 抓捕判定：猫队玩家指定了目标鼠队玩家
-        if (player.team == Room.Team.CAT && json.has("targetPlayer") && !json.get("targetPlayer").isJsonNull()) {
-            var targetName = json.get("targetPlayer").getAsString();
+        var targetName = safeStr(json, "targetPlayer", "");
+        if (player.team == Room.Team.CAT && !targetName.isEmpty()) {
             var target = room.getPlayers().stream()
                     .filter(p -> p.name.equals(targetName) && p.team == Room.Team.MOUSE && !p.eliminated)
                     .findFirst().orElse(null);
@@ -418,8 +466,8 @@ public class GameService {
     }
 
     private void handleStatsQuery(String sessionId, JsonObject json) {
-        var name = json.get("playerName").getAsString();
-        var server = json.has("playerServer") ? json.get("playerServer").getAsString() : "";
+        var name = safeStr(json, "playerName", "");
+        var server = safeStr(json, "playerServer", "");
         var stats = statsRepo.findByPlayerNameAndPlayerServer(name, server).orElse(null);
         if (stats == null) {
             broadcaster.send(sessionId, Map.of("type", "STATS_RESULT", "playerName", name, "found", false));

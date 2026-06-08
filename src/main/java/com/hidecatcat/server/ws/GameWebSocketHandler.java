@@ -11,6 +11,7 @@ import org.springframework.web.socket.TextMessage;
 import org.springframework.web.socket.WebSocketSession;
 import org.springframework.web.socket.handler.TextWebSocketHandler;
 
+import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -43,11 +44,15 @@ public class GameWebSocketHandler extends TextWebSocketHandler implements Messag
             return;
         }
 
+        // 先检查房间上限，拒绝则在加入 maps 之前关闭连接
+        if (!gameService.onPlayerJoin(password, session.getId())) {
+            close(session, "服务器房间已满");
+            return;
+        }
+
         sessions.put(session.getId(), session);
         sessionPasswords.put(session.getId(), password);
         log.info("[连接] {} 加入房间 password={}", session.getId(), password);
-
-        gameService.onPlayerJoin(password, session.getId());
     }
 
     @Override
@@ -83,7 +88,8 @@ public class GameWebSocketHandler extends TextWebSocketHandler implements Messag
     /** 向同口令的所有连接广播消息 */
     public void broadcast(String password, Object message) {
         var text = gson.toJson(message);
-        for (var entry : sessionPasswords.entrySet()) {
+        // 快照避免 TOCTOU：afterConnectionClosed 可能并发删除条目
+        for (var entry : new HashMap<>(sessionPasswords).entrySet()) {
             if (entry.getValue().equals(password)) {
                 var session = sessions.get(entry.getKey());
                 if (session != null && session.isOpen()) {
