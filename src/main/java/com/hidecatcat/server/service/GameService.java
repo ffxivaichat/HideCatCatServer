@@ -86,15 +86,33 @@ public class GameService {
         var player = room.findPlayer(sessionId);
         var name = player != null ? player.name : sessionId;
 
+        // 修复 Bug #2：游戏进行中最后一人掉线，先判定胜负、广播 GAME_OVER、写库，再销毁房间
+        if (room.getState() == Room.GameState.PLAYING && room.playerCount() == 1 && player != null) {
+            long eliminated = room.getPlayers().stream()
+                    .filter(p -> p.team == Room.Team.MOUSE && p.eliminated).count();
+            // 最后一人是猫 → 鼠队胜（猫全部掉线）；是鼠 → 猫队胜（鼠掉线视为被抓获）
+            String winner = player.team == Room.Team.CAT ? "MOUSE" : "CAT";
+            long catches = player.team == Room.Team.MOUSE ? eliminated + 1 : eliminated;
+            String reason = player.team == Room.Team.CAT
+                    ? "猫队全部掉线，鼠队获胜"
+                    : "最后一只鼠掉线，猫队获胜";
+            endGame(room, winner, catches, reason);
+        }
+
         room.removePlayer(sessionId);
         log.info("[房间] {} ({}) 离开房间 password={} 剩余人数={}", sessionId, name, password, room.playerCount());
 
         if (room.isEmpty()) {
-            room.cancelTimer();
+            room.cancelTimers();
             rooms.remove(password);
             log.info("[房间] password={} 已销毁", password);
         } else {
             broadcaster.broadcast(password, room.buildPlayerListMessage());
+            // 玩家离开后检查猫队是否已达成胜利条件
+            // （修复：全部鼠掉线后小鼠数量=0，无需等定时器走完）
+            if (room.getState() == Room.GameState.PLAYING) {
+                checkWinCondition(room);
+            }
         }
     }
 
@@ -127,8 +145,8 @@ public class GameService {
             case "JOIN_ROOM" -> handleJoinRoom(room, sessionId, json);
             case "UPDATE_SETTINGS" -> handleUpdateSettings(room, sessionId, json);
             case "READY" -> handleReady(room, sessionId);
-            case "START_GAME" -> handleStartGame(room, sessionId);
-            case "RESET_ROOM" -> handleResetRoom(room, sessionId);
+            case "START_GAME" -> handleStartGame(room, sessionId, json);
+            case "RESET_ROOM" -> handleResetRoom(room, sessionId, json);
             case "POSITION_UPDATE" -> handlePositionUpdate(room, sessionId, json);
             case "STATS_QUERY" -> handleStatsQuery(sessionId, json);
             default -> log.debug("[消息] 未处理类型: {}", type);
@@ -249,7 +267,7 @@ public class GameService {
         }
     }
 
-    private void handleStartGame(Room room, String sessionId) {
+    private void handleStartGame(Room room, String sessionId, JsonObject json) {
         // 只有房主
         if (!sessionId.equals(room.getHostSessionId())) {
             broadcaster.send(sessionId, Map.of("type", "ERROR", "message", "只有房主可以开始游戏"));
@@ -265,6 +283,19 @@ public class GameService {
             return;
         }
 
+        // 如果房主没有手动设置起点，使用房主当前位置作为边界中心
+        var settings = room.getSettings();
+        if (settings.startX == 0 && settings.startY == 0 && settings.startZ == 0) {
+            var pos = json.getAsJsonObject("position");
+            if (pos != null) {
+                settings.startX = safeDouble(pos, "x", 0);
+                settings.startY = safeDouble(pos, "y", 0);
+                settings.startZ = safeDouble(pos, "z", 0);
+                log.info("[开始] 自动记录房主位置作为边界中心: ({},{},{})",
+                        settings.startX, settings.startY, settings.startZ);
+            }
+        }
+
         room.lockSettings();
         room.setState(Room.GameState.PLAYING);
         log.info("[开始] password={} 游戏开始！猫{}人 鼠{}人 时间={}s",
@@ -272,14 +303,15 @@ public class GameService {
                 room.getSettings().timeLimitSec);
 
         // 取消旧定时器（防止旧局定时器毒害新局）
-        room.cancelTimer();
+        room.cancelTimers();
         // 启动新倒计时
         var future = scheduler.schedule(() -> onTimerExpire(room.getPassword()),
                 room.getSettings().timeLimitSec, TimeUnit.SECONDS);
         room.setTimerFuture(future);
+        // 启动僵尸连接清理（每 5 秒检查一次）
+        startZombieCleanup(room);
 
         // 广播开始
-        var settings = room.getSettings();
         broadcaster.broadcast(room.getPassword(), Map.of(
                 "type", "START_GAME",
                 "startPos", Map.of("x", settings.startX, "y", settings.startY, "z", settings.startZ),
@@ -292,9 +324,9 @@ public class GameService {
         ));
     }
 
-    private void handleResetRoom(Room room, String sessionId) {
+    private void handleResetRoom(Room room, String sessionId, JsonObject json) {
         // 重置房间：取消定时器，清空准备状态，回到 WAITING
-        room.cancelTimer();
+        room.cancelTimers();
         room.unlockSettings();
         room.setState(Room.GameState.WAITING);
         room.getSettings().startX = 0;
@@ -305,7 +337,27 @@ public class GameService {
             p.ready = false;
             p.eliminated = false;
             p.x = p.y = p.z = 0;
+            p.lastPositionTime = System.currentTimeMillis();
+            p.outOfBoundsSince = 0;
         }
+
+        // 支持换队：如果消息带了 team 且与当前队伍不同，更新玩家队伍
+        var newTeam = safeStr(json, "team", "");
+        if (!newTeam.isEmpty()) {
+            var player = room.findPlayer(sessionId);
+            if (player != null) {
+                try {
+                    var team = Room.Team.valueOf(newTeam.toUpperCase());
+                    if (player.team != team) {
+                        log.info("[换队] {} 从 {} 切换到 {}", player.name, player.team, team);
+                        player.team = team;
+                    }
+                } catch (IllegalArgumentException ignored) {
+                    log.warn("[换队] 无效队伍: {}", newTeam);
+                }
+            }
+        }
+
         log.info("[重置] password={} 房间已重置", room.getPassword());
         broadcaster.broadcast(room.getPassword(), room.buildPlayerListMessage());
     }
@@ -322,10 +374,48 @@ public class GameService {
             player.x = safeDouble(pos, "x", player.x);
             player.y = safeDouble(pos, "y", player.y);
             player.z = safeDouble(pos, "z", player.z);
+            player.lastPositionTime = System.currentTimeMillis();
         }
 
         // 广播更新后的位置
         broadcaster.broadcast(room.getPassword(), room.buildPlayerListMessage());
+
+        // 越界检测：鼠队玩家超出边界 5 秒自动被抓获
+        if (player.team == Room.Team.MOUSE) {
+            var s = room.getSettings();
+            double dx = player.x - s.startX;
+            double dy = player.y - s.startY;
+            double dz = player.z - s.startZ;
+            double distToCenter = Math.sqrt(dx * dx + dy * dy + dz * dz);
+
+            if (distToCenter > s.radius) {
+                // 越界：开始/继续计时
+                long now = System.currentTimeMillis();
+                if (player.outOfBoundsSince == 0) {
+                    player.outOfBoundsSince = now;
+                }
+                long elapsed = now - player.outOfBoundsSince;
+                if (elapsed >= 5_000) {
+                    player.eliminated = true;
+                    player.outOfBoundsSince = 0;
+                    long remaining = room.mouseCount();
+                    log.info("[越界] {} 超出边界 {}s 自动被抓获！鼠队剩余 {}",
+                            player.name, elapsed / 1000.0, remaining);
+                    broadcaster.broadcast(room.getPassword(), Map.of(
+                            "type", "CATCH_EVENT",
+                            "catName", "边界",
+                            "mouseName", player.name,
+                            "miceRemaining", remaining,
+                            "miceTotal", room.getPlayers().stream().filter(p -> p.team == Room.Team.MOUSE).count()
+                    ));
+                    checkWinCondition(room);
+                    return; // 已淘汰，跳过后续抓捕判定
+                }
+            } else {
+                // 回到界内：重置计时
+                player.outOfBoundsSince = 0;
+            }
+        }
 
         // 抓捕判定：猫队玩家指定了目标鼠队玩家
         var targetName = safeStr(json, "targetPlayer", "");
@@ -381,13 +471,35 @@ public class GameService {
         }
 
         if (catWins) {
-            endGame(room, "CAT", eliminated);
+            endGame(room, "CAT", eliminated, "猫队达成胜利条件");
         }
     }
 
     // ================================================================
     // 游戏结束
     // ================================================================
+
+    /** 启动僵尸连接清理定时任务（每 5 秒扫描一次） */
+    private void startZombieCleanup(Room room) {
+        var future = scheduler.scheduleAtFixedRate(() -> {
+            if (room.getState() != Room.GameState.PLAYING) return;
+            var now = System.currentTimeMillis();
+            var timeoutMs = 15_000L; // 15 秒无坐标 → 视为掉线
+            var zombies = new java.util.ArrayList<String>();
+            for (var p : room.getPlayers()) {
+                if (now - p.lastPositionTime > timeoutMs) {
+                    zombies.add(p.sessionId);
+                }
+            }
+            for (var sid : zombies) {
+                var p = room.findPlayer(sid);
+                log.warn("[僵尸] {} ({}) {}秒无坐标，强制移除",
+                        sid, p != null ? p.name : "?", timeoutMs / 1000);
+                onPlayerLeave(room.getPassword(), sid);
+            }
+        }, 5, 5, TimeUnit.SECONDS);
+        room.setCleanupFuture(future);
+    }
 
     /** 倒计时到期 → 鼠队存活获胜 */
     private void onTimerExpire(String password) {
@@ -396,23 +508,33 @@ public class GameService {
 
         long eliminated = room.getPlayers().stream().filter(p -> p.team == Room.Team.MOUSE && p.eliminated).count();
         log.info("[时间到] password={} 鼠存活={}", password, room.mouseCount());
-        endGame(room, "MOUSE", eliminated);
+        endGame(room, "MOUSE", eliminated, "时间到，鼠队存活");
     }
 
-    private void endGame(Room room, String winnerTeam, long catCatches) {
-        room.cancelTimer();
+    private void endGame(Room room, String winnerTeam, long catCatches, String reason) {
+        room.cancelTimers();
         room.setState(Room.GameState.FINISHED);
         long survivors = room.mouseCount();
 
-        log.info("[结束] password={} 胜者={} 猫抓到={} 鼠存活={}",
-                room.getPassword(), winnerTeam, catCatches, survivors);
+        // 递增房间级别胜负累计
+        if ("CAT".equals(winnerTeam)) {
+            room.incrementCatWins();
+        } else {
+            room.incrementMouseWins();
+        }
+
+        log.info("[结束] password={} 胜者={} 猫抓到={} 鼠存活={} 原因={} 猫胜={} 鼠胜={}",
+                room.getPassword(), winnerTeam, catCatches, survivors, reason,
+                room.getCatWins(), room.getMouseWins());
 
         broadcaster.broadcast(room.getPassword(), Map.of(
                 "type", "GAME_OVER",
                 "winner", winnerTeam,
                 "catCatches", catCatches,
                 "mouseSurvivors", survivors,
-                "reason", winnerTeam.equals("CAT") ? "猫队达成胜利条件" : "时间到，鼠队存活"
+                "reason", reason,
+                "catWins", room.getCatWins(),
+                "mouseWins", room.getMouseWins()
         ));
 
         // 记录到数据库（异步，不阻塞）

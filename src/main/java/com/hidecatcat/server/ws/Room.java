@@ -30,6 +30,12 @@ public class Room {
 
     // 游戏倒计时定时器（房间销毁时取消）
     private ScheduledFuture<?> timerFuture;
+    // 僵尸连接清理定时器（每 5 秒检查一次）
+    private ScheduledFuture<?> cleanupFuture;
+
+    // 房间级别胜负累计（重新开始不清零，房间销毁时清零）
+    private int catWins = 0;
+    private int mouseWins = 0;
 
     public Room(String password) {
         this.password = password;
@@ -85,11 +91,21 @@ public class Room {
 
     public ScheduledFuture<?> getTimerFuture() { return timerFuture; }
     public void setTimerFuture(ScheduledFuture<?> f) { this.timerFuture = f; }
+    public ScheduledFuture<?> getCleanupFuture() { return cleanupFuture; }
+    public void setCleanupFuture(ScheduledFuture<?> f) { this.cleanupFuture = f; }
 
-    /** 取消定时器（房间销毁或新游戏开始时调用） */
-    public void cancelTimer() {
+    public int getCatWins() { return catWins; }
+    public int getMouseWins() { return mouseWins; }
+    public void incrementCatWins() { catWins++; }
+    public void incrementMouseWins() { mouseWins++; }
+
+    /** 取消所有定时器（房间销毁、新游戏开始或游戏结束时调用） */
+    public void cancelTimers() {
         if (timerFuture != null && !timerFuture.isDone()) {
             timerFuture.cancel(false);
+        }
+        if (cleanupFuture != null && !cleanupFuture.isDone()) {
+            cleanupFuture.cancel(false);
         }
     }
 
@@ -123,18 +139,20 @@ public class Room {
                     m.put("z", p.z);
                     return m;
                 }).toList();
-        return Map.of(
-                "type", "player_list",
-                "hostName", hostName,
-                "gameState", state.name(),
-                "roomServer", roomServer != null ? roomServer : "",
-                "roomTerritoryId", territoryId,
-                "catCount", catCount(),
-                "mouseCount", mouseCount(),
-                "settingsLocked", settingsLocked,
-                "settings", settings.toMap(),
-                "players", list
-        );
+        var msg = new java.util.LinkedHashMap<String, Object>();
+        msg.put("type", "player_list");
+        msg.put("hostName", hostName);
+        msg.put("gameState", state.name());
+        msg.put("roomServer", roomServer != null ? roomServer : "");
+        msg.put("roomTerritoryId", territoryId);
+        msg.put("catCount", catCount());
+        msg.put("mouseCount", mouseCount());
+        msg.put("settingsLocked", settingsLocked);
+        msg.put("settings", settings.toMap());
+        msg.put("catWins", catWins);
+        msg.put("mouseWins", mouseWins);
+        msg.put("players", list);
+        return msg;
     }
 
     // ---- 内部类 ----
@@ -142,22 +160,28 @@ public class Room {
     public static class Player {
         public final String sessionId;
         public final String name;
-        public final Team team;
+        public Team team;
         public boolean ready;
         public boolean eliminated;
         public double x, y, z;
         public String server;
+        /** 最后一次收到位置上报的时间戳（用于僵尸连接检测） */
+        public long lastPositionTime;
+        /** 越界起始时间戳（0=在界内，>0=越界时刻），用于越界 5 秒自动抓获 */
+        public long outOfBoundsSince;
 
         Player(String sessionId, String name, Team team) {
             this.sessionId = sessionId;
             this.name = name;
             this.team = team;
+            this.lastPositionTime = System.currentTimeMillis();
+            this.outOfBoundsSince = 0;
         }
     }
 
     public static class Settings {
         public double startX, startY, startZ;
-        public float radius;
+        public float radius = 50f;              // 默认 50 yalms
         public String winCondition = "ALL";   // ALL / COUNT / PERCENT
         public int winCount = 1;
         public int timeLimitSec = 300;        // 默认 5 分钟
